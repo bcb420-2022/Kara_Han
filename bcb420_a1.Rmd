@@ -1,0 +1,428 @@
+---
+title: 'BCB420 Assignment 1: Dataset Selection and Initial Processing'
+author: "Kara Han"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Dataset Introduction
+
+GEO Accession Number: GSE166605
+Title: RNA-sequencing analysis of effect of miR-155 overexpression in human CD14+ monocytes
+Summary: This study investigates two groups, miR-155 and negative control, to understand the effect of miR-155 overexpression in human CD14+ monocytes.
+
+# Data Extraction
+
+First, we will extract raw counts data from GEO directly through R.
+
+```{r}
+# The code in this report is adapted from Dr. Ruth Isserlin's Lecture 4-5 slides (Isserlin, 2022).
+
+# Install required packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+if (!requireNamespace("biomaRt", quietly = TRUE)) {
+    BiocManager::install("biomaRt")
+}
+
+if (!requireNamespace("GEOquery", quietly = TRUE)) {
+    BiocManager::install("GEOquery")
+}
+
+if (!requireNamespace("edgeR", quietly = TRUE)) {
+    BiocManager::install("edgeR")
+}
+
+if (!requireNamespace("limma", quietly = TRUE)) {
+    BiocManager::install("limma")
+}
+
+if (!require("dplyr", quietly = TRUE)) {
+    install.packages("dplyr")
+}
+
+# A way to download the dataset only when necessary instead of re-downloading it every time the Notebook is run
+gseDirectory <- "/home/rstudio/projects/GSE166605"
+if (!file.exists(gseDirectory)) {
+  # Get the supplementary files from GEO
+  suppFiles <- GEOquery::getGEOSuppFiles("GSE166605")
+  # There is only one supplementary file
+  fnames <- rownames(suppFiles)
+} else {
+  fnames <- paste(gseDirectory, "GSE166605_D1-5_Neg_C_miR_155_RAW_counts.txt.gz", sep = "/")
+}
+
+# Read in the expression data
+expData <- read.delim(fnames[1], header = TRUE, check.names = FALSE)
+head(expData)
+```
+
+<br/>
+
+# Cleaning the Data
+
+First, we'll get an overview of the dataset and check if there are any duplicated genes. 
+
+````{r}
+# How many genes do we have measurements for?
+dim(expData) # 60603 rows, 12 columns
+length(unique(expData$GeneID)) # 60603
+
+colnames(expData)
+
+# Compute the overview statistics to assess the quality of your data for both control and test conditions
+summary(expData)
+
+# Are there any expression values that are not unique for specific genes?
+dplyr::distinct(expData)
+length(unique(expData$GeneID)) # 60603
+
+# Get the summarized counts for each gene
+geneCounts <- sort(table(expData$`Gene name`), decreasing = TRUE)
+head(geneCounts)
+````
+
+We see that there are indeed many duplicated genes including 756 RF00019 and 170 RF00017. The top 3 most duplicated genes in the dataset, RF00019, RF00017, and RF00012, encode for Y RNAs (small non-coding RNA), signal recognition particle RNA, and U3 snoRNA (non-coding RNA), respectively. 
+
+## Filter Data
+
+According to the `edgeR` protocol, weakly expressed and non-informative features should be removed. Therefore, our next step involves filtering out genes that have low counts. It is recommended in `edgeR` to remove genes that have less than one read per million (CPM) in n of the samples, where n is the size of the smallest group of replicates. For my dataset, there are 5 samples in each group (miR-155 and negative control), so we set n=5.
+
+````{r}
+# Translate raw counts into counts per million (CPM)
+cpms <- edgeR::cpm(expData[, 3:12])
+rownames(cpms) <- expData[, 1]
+
+# Keep the genes with high enough counts
+keep <- rowSums(cpms > 1) >= 5
+expDataFiltered <- expData[keep, ] # 13003 observations
+
+dim(expDataFiltered) # 13003 rows, 12 columns
+length(unique(expDataFiltered$GeneID)) #13003
+
+geneCountsFiltered <- sort(table(expDataFiltered$`Gene name`), decreasing = TRUE)
+# The duplicate issues have been largely solved
+head(geneCountsFiltered)
+````
+
+<br/>
+
+# Normalization
+
+To choose a suitable normalization method, the first step is to obtain the distribution of the data using a box plot and a density plot.
+
+````{r}
+# Calculate the log2 CPM with the filtered data
+log2Cpms <- log2(edgeR::cpm(expDataFiltered[, 3:12]))
+
+# A function to draw the box plot
+drawBoxPlot <- function(log2Cpms, title) {
+  boxplot(log2Cpms, xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.4, cex.axis = 0.35, main = title)
+  # Draw the median line on each box plot
+  abline(h = median(apply(log2Cpms, 2, median)), col = "red", lwd = 1.5, lty = "dashed")
+}
+
+drawBoxPlot(log2Cpms, title = "Log2 CPMs of miR-155 RNASeq Samples")
+````
+
+We obtained some warnings from R console complaining that outliers (-Inf) are
+not drawn in our box plot. After an examination of the dataframe `log2Cpms`,
+I found that an outlier is obtained when the gene's CPM=0 for that sample. Since
+our criteria is to remove genes without at least 1 read per million in 5 of the
+samples and we've removed those genes, we can ignore the warnings and move on
+to the next step.
+
+Next, we'll make a density plot for the log2-CPMs.
+
+````{r}
+drawDensityPlot <- function(countsData, title, cex) {
+  # Calculate the density in each sample
+  countsDensity <- apply(log2(edgeR::cpm(countsData)), 2, density)
+  
+  # Calculate the limits across all the samples
+  xlim <- 0
+  ylim <- 0
+  for (i in 1:length(countsDensity)) {
+    xlim <- range(c(xlim, countsDensity[[i]]$x))
+    ylim <- range(c(ylim, countsDensity[[i]]$y))
+  }
+  
+  # Set the colors and line types for the density plot
+  cols <- rainbow(length(countsDensity))
+  ltys <- rep(1, length(countsDensity))
+  
+  # Initialize the plot
+  plot(countsDensity[[1]], xlim = xlim, ylim = ylim, type = "n",
+       ylab = "Smoothing density of log2-CPM",
+       main = title, cex.lab = 0.85)
+  
+  # Plot each line
+  for (i in 1:length(countsDensity)) {
+    lines(countsDensity[[i]], col = cols[i], lty = ltys[i])
+  }
+  
+  # Create a legend
+  legend("topright", colnames(log2Cpms), col = cols, lty = ltys,
+         cex = cex, merge = TRUE)
+}
+countsData <- expDataFiltered[, 3:12]
+drawDensityPlot(countsData, 
+                title = "Density Plot of log2-CPM for miR-155 RNASeq Samples",
+                cex = 0.75)
+````
+
+The distribution of the samples are not normal. We need to apply a normalization 
+method to account for some of the technical variations in our data. The authors
+in the original paper used the `DESeq2` package for their counts normalization. 
+Since `edgeR` and `DESeq2` are both based on the hypothesis that most genes are
+not differentially expressed and they give very similar results (add), I decided
+to use the `edger` package for my data normalization. I want to compare the results
+with the author's to see if there's anything different.
+
+````{r}
+# Make sure the filtered counts is a matrix
+filteredDataMatrix <- as.matrix(expDataFiltered[, 3:12])
+rownames(filteredDataMatrix) <- expDataFiltered$GeneID
+head(filteredDataMatrix)
+
+# Define the cell types
+# Extract the donor and cell types from the original data
+samples <- data.frame(lapply(colnames(expData)[3:12], 
+                             FUN = function(x) {unlist(strsplit(x, split = " "))[c(1, 3)]}))
+colnames(samples) <- colnames(expData)[3:12]
+rownames(samples) <- c("donors", "cell_type")
+samples <- data.frame(t(samples))
+
+# Create a DGEList object
+d <- edgeR::DGEList(counts = filteredDataMatrix, group = samples$cell_type)
+# Calculate the normalization factors
+dgeObj <- edgeR::calcNormFactors(d, method = "TMM")
+
+# What are the normalized counts?
+normalizedCounts <- edgeR::cpm(dgeObj)
+head(normalizedCounts)
+summary(normalizedCounts)
+````
+
+## Exploratory Data Analysis
+
+Let's compare the box plot and density plot before and after normalization to 
+demonstrate the effect of normalization on our data.
+
+````{r}
+# Compare the box plots
+par(mfrow = c(1, 2))
+drawBoxPlot(log2Cpms, title = "Original Counts")
+drawBoxPlot(log2(normalizedCounts), title = "Normalized")
+
+par(mfrow = c(1, 2))
+countsData <- expDataFiltered[, 3:12]
+drawDensityPlot(countsData, title = "Original Counts", cex = 0.4)
+drawDensityPlot(normalizedCounts, title = "Normalized", cex = 0.4)
+````
+Even though the density plots almost look the same before and after normalization, 
+we do see the effect of normalization through the comparison of the box plots: 
+the medians of each sample are adjusted and now fit the median line better. 
+For both box and density plots, the post-normalization plot distributes in the 
+same intervals with the same density center as the pre-normalization plot, suggesting correct use of normalization in this case.
+
+We'll also use a multidimensional scaling (MDS) plot to represent the distances
+between samples post normalization.
+
+````{r}
+limma::plotMDS(d, labels = rownames(samples), col = c("darkgreen", "blue")[factor(samples$cell_type)])
+````
+
+Notice that the two groups of the samples are clearly separated, suggesting that
+miR-155 groups and negative control groups indeed have different behaviors across 
+their counts and differential expressions. 
+
+Next, we'll use `edgeR` to calculate the dispersion, which measures how much
+variation there is in our samples.
+
+````{r}
+# Calculate the dispersion
+modelMatrix <- model.matrix(~samples$donors + samples$cell_type+0)
+dispersion <- edgeR::estimateDisp(d, modelMatrix)
+
+# Plot the biological coefficient of variation (BCV)
+edgeR::plotBCV(dispersion, col.tagwise = "black", col.common = "red")
+
+# Plot the mean-variance relationship
+edgeR::plotMeanVar(dispersion, 
+                   show.raw.vars = TRUE,
+                   show.tagwise.vars = TRUE,
+                   NBline = FALSE,
+                   show.ave.raw.vars = TRUE,
+                   show.binned.common.disp.vars = TRUE)
+````
+
+# Identifier Mapping
+
+In this final step, we'll map the ensembl gene IDs to HGNC symbols in our dataset.
+
+````{r}
+# Load the biomaRt library and choose the Mart and Dataset to use
+library(biomaRt)
+
+# The line below is run to avoid Error in curl::curl_fetch_memory(url, handle = handle)
+# when running the useMart function
+httr::set_config(httr::config(ssl_verifypeer = 0L))
+ensembl <- useMart("ensembl")
+hsapiens <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+# Before the conversion, we'll remove the version numbers after "." in the 
+# ensembl gene ID column in our original dataset for use in biomaRt
+newExpDataFiltered <- expDataFiltered
+newExpDataFiltered$GeneID <- gsub("\\..*", "", newExpDataFiltered$GeneID)
+
+# Convert the ensembl gene IDs to HGNC symbols
+conversions <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                     filters = c("ensembl_gene_id"),
+                     values = newExpDataFiltered$GeneID,
+                     mart = hsapiens)
+````
+
+Let's evaluate this conversion.
+
+````{r}
+# We were able to map 12978 genes
+length(which(gsub("\\..*", "", rownames(normalizedCounts)) %in% conversions$ensembl_gene_id))
+
+# Out of 13003 genes that we started with
+nrow(normalizedCounts)
+
+# The difference is 25 genes
+nrow(normalizedCounts) - length(which(gsub("\\..*", "", rownames(normalizedCounts)) %in% conversions$ensembl_gene_id))
+
+# Merging the new identifiers
+rownames(normalizedCounts) <- gsub("\\..*", "", rownames(normalizedCounts))
+normalizedCountsHGNC <- merge(conversions, normalizedCounts, 
+                              by.x = 'ensembl_gene_id', 
+                              by.y = 'row.names', 
+                              all.y = TRUE)
+
+# Getting an overview of the new dataset
+nrow(normalizedCountsHGNC) # 13004
+length(unique(normalizedCountsHGNC$ensembl_gene_id)) #13003
+````
+
+We see that merging the two datasets resulted in a total of 13004 rows, but there
+are only 13003 unique Ensembl gene IDs. This means that two rows have the same
+Ensembl gene ID. Let's find out which rows those are.
+
+````{r}
+# The code below is adapted from https://stackoverflow.com/questions/16905425/find-duplicate-values-in-r.
+n_occur <- data.frame(table(normalizedCountsHGNC$ensembl_gene_id))
+normalizedCountsHGNC[normalizedCountsHGNC$ensembl_gene_id %in% n_occur$Var1[n_occur$Freq > 1],]
+
+# The same Ensembl gene ID mapped to different HGNC symbols - and the counts are
+# the same for the two rows, which introduces repeating information.e\
+# Let's go back to normalizedCounts and check whether ENSG00000276085 is also repeated
+normalizedCounts[gsub("\\..*", "", rownames(normalizedCounts)) == "ENSG00000276085", ]
+````
+
+It only resulted in one row, which means that there is only one row containing
+the Ensembl ID ENSG00000276085 in the original dataset. 
+
+Now is a good idea to do a manual verification for the two HGNC symbols: CCL3L3
+and CCL3L1. CCL3L3 has ID ENSG00000276085.1, while CCL3L1 has ID ENSG00000277336.2.
+It seems like there might be a slight problem with mapping the gene symbols, possibly
+an Ensembl version update issue. 
+
+We have ENSG00000276085.1 in our original dataset, so I've decided to remove the row
+containing CCL3L1 from the normalizedCountsHGNC. 
+
+````{r}
+# Remove the row containing CCL3L1 from normalizedCountsHGNC
+normalizedCountsHGNC <- normalizedCountsHGNC[-c(12596), ]
+# Now there is only one row left with Ensembl ID ENSG00000276085
+normalizedCountsHGNC[normalizedCountsHGNC$ensembl_gene_id == "ENSG00000276085", ]
+# Change the row names to the Ensembl gene IDs
+rownames(normalizedCountsHGNC) <- normalizedCountsHGNC$ensembl_gene_id
+````
+
+Next, let's figure out how many genes are missing HGNC symbols.
+
+````{r}
+# How many identifiers are missing?
+ensemblMissingGenes <- normalizedCountsHGNC$ensembl_gene_id[which(is.na(normalizedCountsHGNC$hgnc_symbol))]
+
+# There are 25 genes missing HGNC symbols
+length(ensemblMissingGenes)
+
+# which is ~0.1% of our dataset
+25 / 13003
+
+ensemblMissingGenesDF <- data.frame(GeneID = ensemblMissingGenes)
+oldMapping <- merge(newExpDataFiltered[, 1:2], ensemblMissingGenesDF,
+                    by = 'GeneID')
+nrow(oldMapping)
+head(oldMapping)
+````
+
+Since the genes missing HGNC symbols only make up 0.1% of our data, I will leave
+them as NAs for now and refer back to the original data for gene names if needed
+in the future.
+
+# Interpretation
+
+1. What are the control and test conditions of the dataset?
+
+The test condition is CD14+ monocytes transfected with miR-155.
+The control condition is CD14+ monocytes transfected with negative control mimic.
+
+2. Why is the dataset of interest to you?
+
+I'm fascinated by the disease mechanisms of autoimmune diseases - your immune
+system attacks healthy cells by mistake and causes inflammation. And this dataset
+studies the role of miR-155 that is implicated in rheumatoid arthritis (RA, an
+autoimmune disease), which is a very painful disease that causes many inconveniences 
+and can damage other body systems. 
+
+3. Were there expression values that were not unique for specific genes? How did you handle these?
+
+All expression values and Ensembl IDs were unique for specific genes in the
+original dataset.
+
+4. Were there expression values that could not be mapped to current HUGO symbols?
+
+There were a total of 25 out of 13003 (~0.1%) genes that could not be mapped to 
+current HUGO symbols. Since these genes only make up a small amount of the dataset,
+I left them as NAs and will work with the Ensembl ID to find the gene if needed
+in future analyses. 
+
+5. How many outliers were removed?
+
+No significant outliers were found so none were removed. 
+
+6. How did you handle replicates?
+
+The samples came from 5 different donors, which are noise sources. To handle 
+replicates, I first extracted the donors and cell types from the original dataset
+to get a clear picture of what the samples are. Then, I applied normalization
+to take care of technical variations. Finally, genes with low counts in more than 
+5 samples removed to ensure the quality of the data.
+
+7. What is the final coverage of your dataset?
+
+The final coverage of my dataset is 13003 genes with their Ensembl gene IDs,
+HGNC symbols, and normalized counts in 10 samples. 
+
+# References
+
+Isserlin, R. (2022). Lecture 4 - Data Exploration and Normalization. Quercus.
+https://q.utoronto.ca/courses/248455/files/19273570?module_item_id=3476594
+
+Isserlin, R. (2022). Lecture 5 - Data Exploration and Identifier Mapping. 
+Quercus.
+https://q.utoronto.ca/courses/248455/files/18120883?module_item_id=3463354
+
+Kikapp. (2013). Find duplicate values in R. https://stackoverflow.com/questions/16905425/find-duplicate-values-in-r.
