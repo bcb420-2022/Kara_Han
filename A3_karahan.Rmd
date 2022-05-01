@@ -1,7 +1,6 @@
 ---
 title: 'Assignment 3: Pathway and Network Analysis'
 author: "Kara Han"
-date: "`r format(Sys.time(), '%d %b %Y')`"
 output:
   html_document:
     df_print: paged
