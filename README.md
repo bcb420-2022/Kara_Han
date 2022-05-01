@@ -5,3 +5,5 @@ Link to HTML Notebook for A1: https://github.com/bcb420-2022/Kara_Han/blob/main/
 
 
 Link to HTML Notebook for A2: https://github.com/bcb420-2022/Kara_Han/blob/main/A2_karahan.html
+
+Link to HTML Notebook for A3: https://github.com/bcb420-2022/Kara_Han/blob/main/A3_karahan.html
